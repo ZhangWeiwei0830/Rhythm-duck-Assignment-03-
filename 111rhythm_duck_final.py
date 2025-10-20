@@ -28,13 +28,25 @@ HIT_WIN  = 6
 MOUTH_T  = 0.15
 
 HP_SEGMENTS    = 10
-# A miss reduces 2 HP segments; after 5 misses the player fails (5*2 = 10 segments)
-MISSES_TO_FAIL = 5
+# A miss reduces 2 HP segments. We'll use miss_count (per-note misses).
+# Assumption: thresholds are mapped as follows (per your spec):
+# 0 misses -> 3 stars
+# 1 miss  -> 2 stars (HP 8)
+# 2-3 misses -> 1 star (HP 6 or 4) — user spec was ambiguous for 2 misses, we treat 2 as 1 star
+# 4+ misses -> fail (no pass). Mid-game HP <= 0 also triggers fail.
+MAX_MISSES = 4
 
 # ---- Audio ----
 SR    = 44100
 VOL   = 0.9
-MUTED = False
+
+# Lightweight config to avoid scattering globals
+class GameConfig:
+    def __init__(self):
+        self.muted = False
+        self.note_style = "sun"
+
+GAME_CFG = GameConfig()
 
 def square_sound(freq=440, length=0.24, vol=1.0):
     n = int(length*SR)
@@ -186,7 +198,6 @@ def draw_duck(s, x, y, mouth=False):
     px_rect(s, x+13, y-2, 6 if mouth else 3, 3, C_BEAK)
 
 # ---- Notes: sun / cloud ----
-NOTE_STYLE = "sun"
 def draw_sun(s, cx, cy, miss=False):
     c = C_MISS if miss else C_NOTE
     px_rect(s, cx-2, cy-2, 5, 5, c)
@@ -200,7 +211,7 @@ def draw_cloud(s, cx, cy, miss=False):
     px_rect(s, cx+4, cy-2, 4, 3, c)
 
 def draw_note(s, x,y, miss=False):
-    (draw_cloud if NOTE_STYLE=="cloud" else draw_sun)(s, int(x), int(y), miss)
+    (draw_cloud if GAME_CFG.note_style=="cloud" else draw_sun)(s, int(x), int(y), miss)
 
 # ---- Pixel buttons (graphics only, no unicode) ----
 def btn_box(s, r, active=True): px_rect(s, r.x, r.y, r.w, r.h, (230,230,230) if active else (180,180,180))
@@ -337,9 +348,37 @@ def build_schedule(level):
     # 已按顺序生成；返回给主循环使用
     return schedule
 
+# ----------------- Scoring -----------------
+def score_for_hit(offset):
+    """Return score label and points based on timing offset (seconds)."""
+    a = abs(offset)
+    if a <= 0.05:
+        return "Perfect", 300
+    if a <= 0.12:
+        return "Great", 150
+    if a <= 0.25:
+        return "Good", 80
+    return "OK", 30
+
+def load_best_score():
+    try:
+        with open('best_score.txt','r') as f:
+            return int(f.read().strip() or 0)
+    except Exception:
+        return 0
+
+def save_best_score(v):
+    try:
+        with open('best_score.txt','w') as f:
+            f.write(str(int(v)))
+    except Exception:
+        pass
+
 # ================= Main =================
 def main():
-    global MUTED, NOTE_STYLE
+    global GAME_CFG
+    # replace globals with config usage
+    global GAME_CFG
     # command-line flags
     record_mode = ('--record' in sys.argv) or ('--auto-record' in sys.argv)
     frames_dir = None
@@ -357,6 +396,10 @@ def main():
         frames_dir = os.path.join(out_root, f'rhythm_duck_demo_{ts}')
         os.makedirs(frames_dir, exist_ok=True)
         print('Recording frames to', frames_dir)
+        frames_muxed = False
+        # used to ensure frames finished writing before mux
+        frames_last_count = 0
+        frames_last_stable_since = None
 
     lane_sounds=[square_sound(f,0.24,VOL) for f in LANE_FREQS]
     sfx_eat=noise_click(0.05,0.45)
@@ -364,21 +407,32 @@ def main():
     bg_ch=pygame.mixer.Channel(0)
     def play_bg(bpm):
         snd=bg_song_twinkle(bpm)
-        if not MUTED: bg_ch.play(snd, loops=-1)
+        if not GAME_CFG.muted: bg_ch.play(snd, loops=-1)
         else: bg_ch.stop()
 
     state="menu"; unlocked=1; level_idx=0
     lvl=LEVELS[level_idx]; laneYs=lane_ys_for(lvl["lanes"])
     duck=Duck(laneYs)
 
-    misses=0; t=0.0; upcoming=[]; notes=[]; flash_t=0.0
+    # scoring
+    score = 0
+    last_hit_label = None
+    best_score = load_best_score()
+
+    miss_count=0; t=0.0; upcoming=[]; notes=[]; flash_t=0.0
 
     def start_level(i):
-        nonlocal lvl, laneYs, t, upcoming, notes, misses
-        lvl = LEVELS[i]; laneYs = lane_ys_for(lvl["lanes"])
+        nonlocal lvl, laneYs, t, upcoming, notes, miss_count, score, last_hit_label
+        lvl = LEVELS[i]
+        laneYs = lane_ys_for(lvl["lanes"])
         duck.set_lanes(laneYs)
-        misses=0; t=0.0; notes=[]; upcoming=build_schedule(lvl)
+        miss_count = 0
+        t = 0.0
+        notes = []
+        upcoming = build_schedule(lvl)
         play_bg(lvl["bpm"])
+        score = 0
+        last_hit_label = None
 
     # Pixel buttons (no unicode)
     r_style = pygame.Rect(PX_W-36, 4, 14, 12)
@@ -398,8 +452,8 @@ def main():
             if e.type == pygame.KEYDOWN:
                 if e.key in (pygame.K_ESCAPE, pygame.K_q): pygame.quit(); sys.exit(0)
                 if e.key == pygame.K_m:
-                    MUTED = not MUTED
-                    if MUTED: bg_ch.stop()
+                    GAME_CFG.muted = not GAME_CFG.muted
+                    if GAME_CFG.muted: bg_ch.stop()
                     else: play_bg(lvl["bpm"])
                 if e.key == pygame.K_RETURN:
                     # Enter/Return also retries when failing
@@ -420,11 +474,11 @@ def main():
             if e.type == pygame.MOUSEBUTTONDOWN:
                 mx,my = pygame.mouse.get_pos(); mx//=SCALE; my//=SCALE
                 if r_music.collidepoint(mx,my):
-                    MUTED = not MUTED
-                    if MUTED: bg_ch.stop()
+                    GAME_CFG.muted = not GAME_CFG.muted
+                    if GAME_CFG.muted: bg_ch.stop()
                     else: play_bg(lvl["bpm"])
                 elif r_style.collidepoint(mx,my):
-                    NOTE_STYLE = "cloud" if NOTE_STYLE=="sun" else "sun"
+                    GAME_CFG.note_style = "cloud" if GAME_CFG.note_style=="sun" else "sun"
                 elif state=="menu" and r_start.collidepoint(mx,my):
                     state="select"
                 elif state=="playing" and r_exit.collidepoint(mx,my):
@@ -444,11 +498,14 @@ def main():
         # ===== Update =====
         if state=="playing":
             t += dt
+
+            # spawn scheduled notes
             while upcoming and upcoming[0]["spawn"] <= t:
                 info = upcoming.pop(0)
                 notes.append(Note(PX_W+10, info["lane"], laneYs[info["lane"]]))
 
-            for n in notes: n.update(dt)
+            for n in notes:
+                n.update(dt)
 
             # auto-play: if recording, perform perfect hits when notes enter hit window
             if record_mode:
@@ -459,45 +516,76 @@ def main():
                         duck.y = duck.lanes[duck.idx]
                         n.hit = True
                         duck.eat()
-                        if not MUTED:
+                        if not GAME_CFG.muted:
                             lane_sounds[min(n.lane,2)].play(); sfx_eat.play()
+                        # scoring for auto-hit: assume perfect (offset ~=0)
+                        label, pts = score_for_hit(0.0)
+                        score += pts
+                        last_hit_label = label
+
+            # player input hit detection
             for n in notes:
                 if not n.hit and not n.missed and n.lane==duck.idx and abs(n.x-HIT_X)<=HIT_WIN:
                     n.hit=True; duck.eat()
-                    if not MUTED:
+                    # compute timing offset based on x distance
+                    offset = (n.x - HIT_X) / NOTE_SPD
+                    label, pts = score_for_hit(offset)
+                    score += pts
+                    last_hit_label = label
+                    if not GAME_CFG.muted:
                         lane_sounds[min(n.lane,2)].play(); sfx_eat.play()
 
+            # process misses
             for n in notes:
                 if n.missed:
-                    misses += 2  # each miss deducts 2 segments
+                    miss_count += 1
+                    # each miss reduces HP segments by 2
+                    score = max(0, score-50)
                     n.missed=False
 
             notes = [n for n in notes if n.x>-8 and not (n.hit and n.x<HIT_X-10)]
             duck.update(dt)
 
-            if misses >= MISSES_TO_FAIL:
+            # fail if too many misses or HP depleted
+            if miss_count >= MAX_MISSES or (HP_SEGMENTS - miss_count*2) <= 0:
                 state="fail"; bg_ch.stop()
             elif not upcoming and not notes:
                 state="pass"; bg_ch.stop()
                 unlocked = max(unlocked, min(level_idx+2, len(LEVELS)))
+                # determine stars for this level based on miss_count
+                def stars_for_misses(m):
+                    if m == 0: return 3
+                    if m in (1,2): return 2
+                    if m == 3: return 1
+                    return 0
+                level_stars = stars_for_misses(miss_count)
+                # update best score
+                if score > best_score:
+                    best_score = score
+                    save_best_score(best_score)
 
         # ===== Draw to pixel canvas =====
         draw_bg(px, laneYs)
 
         # top-left minimal info (crisp)
         px_text(px, f"Lv{level_idx+1} BPM{lvl['bpm']} L{lvl['lanes']}", 6, 4)
+        # score display
+        px_text(px, f"SCORE: {score}", 6, 16)
+        if last_hit_label:
+            px_text(px, f"{last_hit_label}", PX_W-60, 6, color=(255,215,0))
 
         # buttons
         btn_style_toggle(px, r_style)
-        btn_speaker(px, r_music, muted=MUTED)
-        if state=="playing": btn_eject(px, r_exit)
+        btn_speaker(px, r_music, muted=GAME_CFG.muted)
+        if state=="playing":
+            btn_eject(px, r_exit)
 
         # notes & duck
         for n in notes: n.draw(px)
         duck.draw(px)
 
         # HP 10 segments right side, flash if <=2
-        remain = max(0, HP_SEGMENTS - misses)
+        remain = max(0, HP_SEGMENTS - miss_count*2)
         flash_t += dt
         bottom_margin_px = 6
         grid_x, grid_y = PX_W-12, PX_H-58 - bottom_margin_px
@@ -521,14 +609,18 @@ def main():
             px_text(px, "W/S or Up/Down  •  Space/Delete  •  M toggle", 12, PX_H-18)
         elif state=="select":
             px_text_center(px, "SELECT LEVEL", PX_W//2, 18)
+            mx,my = pygame.mouse.get_pos(); mx//=SCALE; my//=SCALE
             for i,_ in enumerate(LEVELS):
                 r = pygame.Rect(30 + i*70, 48, 60, 20)
-                btn_box(px, r, active=(i<unlocked))
+                hovered = r.collidepoint(mx,my)
+                # highlight on hover
+                if hovered:
+                    btn_box(px, r, active=True)
+                else:
+                    btn_box(px, r, active=(i<unlocked))
                 px_text(px, f"{i+1}", r.x+26, r.y+6)
-                if i<unlocked and pygame.mouse.get_pressed()[0]:
-                    mx,my = pygame.mouse.get_pos(); mx//=SCALE; my//=SCALE
-                    if r.collidepoint(mx,my):
-                        level_idx=i; start_level(level_idx); state="playing"
+                if i<unlocked and pygame.mouse.get_pressed()[0] and hovered:
+                    level_idx=i; start_level(level_idx); state="playing"
             px_text(px, "Space/Delete to play", PX_W//2-40, PX_H-18)
         elif state=="fail":
             px_text_center(px, "FAILED", PX_W//2, PX_H//2-16)
@@ -538,6 +630,16 @@ def main():
             px_text(px, "RETRY", r_retry.x+8, r_retry.y+1, color=(10,10,10))
         elif state=="pass":
             # non-final levels: show home/next with labels; final level shows trophy
+            # show star rating
+            try:
+                stars = level_stars
+            except NameError:
+                stars = 0
+            sx = PX_W//2 - 18
+            sy = PX_H//2 + 28
+            for i in range(3):
+                col = (255,215,0) if i < stars else (180,180,180)
+                px_rect(px, sx + i*12, sy, 8, 8, col)
             if level_idx == len(LEVELS)-1:
                 # final clear: larger green message + multi-pixel trophy sprite
                 px_text_center(px, "恭喜你通关！", PX_W//2, PX_H//2-30, color=(46,204,113), size=14, outline=True)
@@ -581,6 +683,35 @@ def main():
                 pygame.image.save(screen, fname)
             except Exception as e:
                 print('frame save error', e)
+
+        # after level end, if recording was enabled, auto-mux frames into mp4 (requires ffmpeg installed)
+        try:
+                if record_mode and frames_dir is not None and not frames_muxed and state in ("pass","fail","menu"):
+                    # wait until frame files stop growing for a short stable period
+                    try:
+                        count = len([n for n in os.listdir(frames_dir) if n.endswith('.png')])
+                    except Exception:
+                        count = 0
+                    now = time.time()
+                    if count == frames_last_count:
+                        if frames_last_stable_since is None:
+                            frames_last_stable_since = now
+                        elif now - frames_last_stable_since >= 0.6:
+                            out_mp4 = os.path.join(out_root, f'rhythm_duck_{ts}.mp4')
+                            print('Muxing frames ->', out_mp4)
+                            try:
+                                import imageio_ffmpeg as _ff
+                                ffexe = _ff.get_ffmpeg_exe()
+                            except Exception:
+                                ffexe = 'ffmpeg'
+                            cmd = [ffexe, '-y', '-framerate', '60', '-i', os.path.join(frames_dir, 'frame_%05d.png'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', out_mp4]
+                            subprocess.run(cmd)
+                            frames_muxed = True
+                    else:
+                        frames_last_count = count
+                        frames_last_stable_since = now
+        except Exception as e:
+            print('auto-mux error', e)
 
 if __name__ == "__main__":
     pygame.mixer.pre_init(SR, size=16, channels=2, buffer=1024)
